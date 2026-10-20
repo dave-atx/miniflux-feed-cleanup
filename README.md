@@ -10,12 +10,21 @@ It works with stock Miniflux 2.3.4 or newer, through the regular REST API.
 
 ## Install
 
+As a Claude Code plugin:
+
 ```
 /plugin marketplace add dave-atx/miniflux-feed-cleanup
 /plugin install miniflux@miniflux-feed-cleanup
 ```
 
-Then set these in the environment Claude Code runs in:
+Or as a plain skill with [skills](https://github.com/vercel-labs/skills), which also works for other
+agents (Codex, Cursor, etc):
+
+```
+npx skills add dave-atx/miniflux-feed-cleanup
+```
+
+Then set these in the environment your agent runs in:
 
 - `MINIFLUX_URL`: the instance base URL, e.g. `https://reader.example.com`
 - `MINIFLUX_API_KEY`: an API key from Settings > API Keys

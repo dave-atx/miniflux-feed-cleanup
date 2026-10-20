@@ -1,0 +1,14 @@
+{
+  "name": "miniflux-feed-cleanup",
+  "description": "Claude Code plugin for cleaning up Miniflux feeds.",
+  "owner": {
+    "name": "Dave Marquard"
+  },
+  "plugins": [
+    {
+      "name": "miniflux",
+      "source": "./",
+      "description": "Author and preview per-feed cleanup rules for a Miniflux instance."
+    }
+  ]
+}

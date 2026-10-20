@@ -1,0 +1,10 @@
+{
+  "name": "miniflux",
+  "version": "0.1.0",
+  "description": "Author per-feed cleanup rules for a Miniflux instance (rewrite, scraper, URL rewrite and block/keep filters), previewed against Miniflux's real processing pipeline before anything is saved.",
+  "author": {
+    "name": "Dave Marquard"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["miniflux", "rss", "feeds"]
+}

@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# mf: small Miniflux API helper for the feed-cleanup skill.
+#
+# Needs curl and jq, plus MINIFLUX_URL and MINIFLUX_API_KEY in the environment.
+# The preview subcommand also needs git and a Go toolchain: it builds the
+# skill's rewrite-preview source inside a stock Miniflux checkout with
+# go build -overlay. The checkout is a cached clone of upstream Miniflux at the
+# server's own commit, or MINIFLUX_SRC if set.
+set -euo pipefail
+
+SKILL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/feed-cleanup
+UPSTREAM=${MINIFLUX_UPSTREAM:-https://github.com/miniflux/v2.git}
+
+FIELDS=(rewrite_rules scraper_rules urlrewrite_rules block_filter_entry_rules keep_filter_entry_rules crawler)
+
+usage() {
+	cat <<'USAGE'
+usage: mf <command> [args]
+
+  version                    server version and commit
+  feeds                      every feed: id, title, site/feed URL, crawler, which rule fields are set
+  feed ID                    one feed's rule fields
+  entry ID                   one entry: id, feed_id, title, url
+  get PATH                   raw GET, e.g. mf get '/v1/entries?feed_id=4&limit=1'
+  preview ID [flags...]      run the rewrite preview against feed ID (extra flags passed through)
+  apply ID DIR [--dry-run]   PUT the rule fields that have a file in DIR (named after the API field);
+                             --dry-run prints the JSON body instead of sending it
+  refresh ID [--force]       refresh a feed; --force reprocesses stored entries still in the feed
+USAGE
+	exit 2
+}
+
+need_env() {
+	: "${MINIFLUX_URL:?MINIFLUX_URL is not set (e.g. https://reader.example.com)}"
+	: "${MINIFLUX_API_KEY:?MINIFLUX_API_KEY is not set (create one under Settings > API Keys)}"
+	MINIFLUX_URL=${MINIFLUX_URL%/}
+}
+
+# api METHOD PATH [BODY_FILE]: prints the response body; on a non-2xx status,
+# prints the status and body to stderr and fails.
+api() {
+	local method=$1 path=$2 body=${3:-} out status
+	out=$(mktemp)
+	local args=(-sS -X "$method" -o "$out" -w '%{http_code}' -H "X-Auth-Token: $MINIFLUX_API_KEY")
+	if [[ -n $body ]]; then
+		args+=(-H 'Content-Type: application/json' --data-binary "@$body")
+	fi
+	status=$(curl "${args[@]}" "$MINIFLUX_URL$path") || { rm -f "$out"; return 1; }
+	if [[ $status != 2* ]]; then
+		echo "mf: $method $path -> HTTP $status" >&2
+		cat "$out" >&2
+		echo >&2
+		rm -f "$out"
+		return 1
+	fi
+	cat "$out"
+	rm -f "$out"
+}
+
+# src_hash: identifies the preview sources, so editing them forces a rebuild.
+src_hash() {
+	[[ -d $SKILL_DIR/preview/cmd/rewrite-preview ]] || {
+		echo "mf: preview sources missing from $SKILL_DIR/preview" >&2
+		return 1
+	}
+	(cd "$SKILL_DIR/preview" && find . -name '*.go' -type f | LC_ALL=C sort | xargs cat) |
+		git hash-object --stdin | cut -c1-8
+}
+
+# upstream_clone: prints the path of the cached upstream clone, creating it on
+# first use. Blobs are fetched lazily, so the clone stays small.
+upstream_clone() {
+	local dir=$CACHE/miniflux
+	if [[ ! -d $dir/.git ]]; then
+		echo "mf: cloning $UPSTREAM into $dir (first run only)" >&2
+		mkdir -p "$CACHE"
+		git clone -q --filter=blob:none --no-checkout "$UPSTREAM" "$dir" >&2
+		touch "$dir/.git/mf-fetched"
+	fi
+	echo "$dir"
+}
+
+# fetch_upstream DIR: fetches new commits and tags, at most once an hour.
+fetch_upstream() {
+	local dir=$1
+	if [[ -n $(find "$dir/.git/mf-fetched" -mmin -60 2>/dev/null) ]]; then
+		return 0
+	fi
+	git -C "$dir" fetch -q --tags origin >&2 || echo "mf: fetching $UPSTREAM failed; using the cached clone" >&2
+	touch "$dir/.git/mf-fetched"
+}
+
+commit_of() {
+	git -C "$1" rev-parse -q --verify "$2^{commit}" 2>/dev/null
+}
+
+# resolve_ref DIR: prints "SHA DESCRIPTION" for the commit to build: the
+# server's own commit when upstream has it, then its release tag, then main.
+resolve_ref() {
+	local dir=$1 info commit version sha attempt
+	info=$(api GET /v1/version)
+	commit=$(jq -r '.commit // ""' <<<"$info")
+	version=$(jq -r '.version // ""' <<<"$info")
+	for attempt in 1 2; do
+		if [[ $commit =~ ^[0-9a-f]{7,40}$ ]] && sha=$(commit_of "$dir" "$commit"); then
+			echo "$sha upstream $commit (the server's commit)"
+			return
+		fi
+		if [[ -n $version ]] && sha=$(commit_of "$dir" "refs/tags/$version"); then
+			echo "$sha upstream $version (the server's release)"
+			return
+		fi
+		[[ $attempt == 1 ]] && fetch_upstream "$dir"
+	done
+	sha=$(commit_of "$dir" origin/main)
+	echo "mf: server $version (commit $commit) is not an upstream commit or release; previewing with upstream main" >&2
+	echo "$sha upstream main ${sha:0:8} (server $version, commit $commit, not found upstream)"
+}
+
+# overlay_entries SRC DIR: prints one JSON overlay entry per Go file in DIR,
+# mapping the same relative path inside the checkout SRC to the file in DIR.
+overlay_entries() {
+	(cd "$2" && find . -name '*.go' -type f | sed 's|^\./||') |
+		jq -R --arg src "$1" --arg dir "$2" '{key: "\($src)/\(.)", value: "\($dir)/\(.)"}'
+}
+
+# build_preview SRC BIN DESC: builds rewrite-preview in the checkout SRC, with
+# the skill's sources overlaid so the checkout itself is never modified.
+# preview-compat backfills validator.IsValidScraperRules for releases that
+# predate it.
+build_preview() {
+	local src=$1 bin=$2 desc=$3 overlay status=0
+	overlay=$(mktemp)
+	{
+		overlay_entries "$src" "$SKILL_DIR/preview"
+		if ! grep -qs 'func IsValidScraperRules' "$src"/internal/validator/*.go; then
+			overlay_entries "$src" "$SKILL_DIR/preview-compat"
+		fi
+	} | jq -s '{Replace: from_entries}' >"$overlay"
+	mkdir -p "$CACHE"
+	(cd "$src" && go build -overlay="$overlay" -ldflags "-X \"main.previewSource=$desc\"" -o "$bin.tmp" ./cmd/rewrite-preview) >&2 ||
+		status=$?
+	rm -f "$overlay"
+	[[ $status -eq 0 ]] && mv "$bin.tmp" "$bin"
+	return $status
+}
+
+# bin_path SHA DESC: the cache path for a build of SHA. DESC is baked into the
+# header, so it's part of the key too.
+bin_path() {
+	echo "$CACHE/rewrite-preview-${1:0:12}-$hash-$(printf '%s' "$2" | git hash-object --stdin | cut -c1-6)"
+}
+
+# preview_bin: prints the path of a rewrite-preview binary matching the server
+# as closely as possible, building it if it isn't cached.
+preview_bin() {
+	local hash src sha desc rev bin
+	hash=$(src_hash) || return 1
+	if [[ -n ${MINIFLUX_SRC:-} ]]; then
+		src=$MINIFLUX_SRC
+		rev=$(git -C "$src" rev-parse --short=12 HEAD)
+		desc="MINIFLUX_SRC $src at $rev"
+		if [[ -n $(git -C "$src" status --porcelain -- internal go.mod go.sum 2>/dev/null) ]]; then
+			rev="$rev-dirty-$(date +%s)"
+			desc="$desc (with uncommitted changes)"
+		fi
+		bin=$(bin_path "$rev" "$desc")
+		[[ -x $bin ]] || build_preview "$src" "$bin" "$desc" || return 1
+		echo "$bin"
+		return
+	fi
+
+	src=$(upstream_clone)
+	read -r sha desc < <(resolve_ref "$src")
+	bin=$(bin_path "$sha" "$desc")
+	# A failed build is remembered for a day, so an audit doesn't retry it for
+	# every feed but a transient failure (e.g. the network) doesn't stick.
+	if [[ ! -x $bin && -z $(find "$bin.failed" -mmin -1440 2>/dev/null) ]]; then
+		git -C "$src" -c advice.detachedHead=false checkout -q --detach "$sha" >&2
+		build_preview "$src" "$bin" "$desc" || touch "$bin.failed"
+	fi
+	if [[ ! -x $bin ]]; then
+		# Releases before 2.3.4 lack rewrite.ValidateRules and don't build; the
+		# latest release is the closest match left.
+		local tag
+		tag=$(git -C "$src" tag -l --sort=-v:refname '[0-9]*.[0-9]*.[0-9]*' | head -1)
+		sha=$(commit_of "$src" "refs/tags/$tag")
+		echo "mf: the preview doesn't build against the server's version; using upstream $tag" >&2
+		desc="upstream $tag (the server's version is too old to build the preview)"
+		bin=$(bin_path "$sha" "$desc")
+		if [[ ! -x $bin ]]; then
+			git -C "$src" -c advice.detachedHead=false checkout -q --detach "$sha" >&2
+			build_preview "$src" "$bin" "$desc" || return 1
+		fi
+	fi
+	echo "$bin"
+}
+
+cmd=${1:-}
+[[ -n $cmd ]] || usage
+shift
+
+case $cmd in
+version)
+	need_env
+	api GET /v1/version | jq '{version, commit, build_date}'
+	;;
+feeds)
+	need_env
+	api GET /v1/feeds | jq '[.[] | {id, title, site_url, feed_url, crawler,
+		rules: ([to_entries[] | select((.key | IN("rewrite_rules","scraper_rules","urlrewrite_rules","block_filter_entry_rules","keep_filter_entry_rules","blocklist_rules","keeplist_rules")) and .value != "") | .key])}]'
+	;;
+feed)
+	[[ $# -eq 1 ]] || usage
+	need_env
+	api GET "/v1/feeds/$1" | jq '{id, title, site_url, feed_url, crawler, rewrite_rules, scraper_rules, urlrewrite_rules,
+		block_filter_entry_rules, keep_filter_entry_rules, blocklist_rules, keeplist_rules}'
+	;;
+entry)
+	[[ $# -eq 1 ]] || usage
+	need_env
+	api GET "/v1/entries/$1" | jq '{id, feed_id, title, url, published_at}'
+	;;
+get)
+	[[ $# -eq 1 ]] || usage
+	need_env
+	api GET "$1"
+	;;
+preview)
+	[[ $# -ge 1 ]] || usage
+	need_env
+	id=$1
+	shift
+	bin=$(preview_bin)
+	exec "$bin" -feed-id "$id" "$@"
+	;;
+apply)
+	[[ $# -eq 2 || ( $# -eq 3 && $3 == --dry-run ) ]] || usage
+	id=$1 dir=$2 dry=${3:-}
+	body=$(mktemp)
+	trap 'rm -f "$body"' EXIT
+	jq_args=() filter='{}' sent=()
+	for f in "${FIELDS[@]}"; do
+		[[ -f $dir/$f ]] || continue
+		sent+=("$f")
+		jq_args+=(--rawfile "$f" "$dir/$f")
+		if [[ $f == crawler ]]; then
+			filter+=" + {crawler: (\$crawler | sub(\"\\n+$\"; \"\") | IN(\"true\", \"1\"))}"
+		else
+			filter+=" + {$f: (\$$f | sub(\"\\n+$\"; \"\"))}"
+		fi
+	done
+	if [[ ${#sent[@]} -eq 0 ]]; then
+		echo "mf: no rule files in $dir (expected any of: ${FIELDS[*]})" >&2
+		exit 1
+	fi
+	jq -n "${jq_args[@]}" "$filter" >"$body"
+	if [[ -n $dry ]]; then
+		cat "$body"
+		exit 0
+	fi
+	need_env
+	api PUT "/v1/feeds/$id" "$body" | jq --argjson keys "$(printf '%s\n' id "${sent[@]}" | jq -R . | jq -s .)" \
+		'with_entries(select(.key as $k | $keys | index($k)))'
+	;;
+refresh)
+	[[ $# -ge 1 ]] || usage
+	need_env
+	q=
+	[[ ${2:-} == --force ]] && q='?force=true'
+	api PUT "/v1/feeds/$1/refresh$q" >/dev/null
+	echo "refreshed feed $1${q:+ (forced)}"
+	;;
+*)
+	usage
+	;;
+esac
